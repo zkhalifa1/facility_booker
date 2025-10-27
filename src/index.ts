@@ -1,7 +1,7 @@
 import express from "express";
 import { Request, Response, NextFunction } from "express";
 import { z } from "zod";
-import { sendEmail } from "./notify.js";
+import { sendEmail, notifyAny } from "./notify.js";
 import { checkAvailability } from "./ubc.js";
 
 const app = express();
@@ -46,34 +46,10 @@ const NotifySchema = z.object({
 });
 
 app.post("/notify", requireBearer, async (req, res) => {
-    const parsed = z.object({
-        notify: NotifySchema,
-        text: z.string(),
-        priority: z.enum(["info", "warn", "urgent"]).optional()
-    }).safeParse(req.body);
-
-    if (!parsed.success) return res.status(400).json({ error: parsed.error.message });
-
-    const { notify, text } = parsed.data;
-
-    if (notify.email) {
-        await sendEmail({
-            to: notify.email,
-            subject: "UBC Tennis Booker",
-            text
-        });
-    } else if (process.env.EMAIL_TO) {
-        // default fallback to EMAIL_TO if provided
-        await sendEmail({
-            to: process.env.EMAIL_TO!,
-            subject: "UBC Tennis Booker",
-            text
-        });
-    }
-
+    const { notify, text } = req.body;
+    await notifyAny({ emailTo: notify?.email, text });
     return res.json({ ok: true });
 });
-
 // --- start ---
 const PORT = parseInt(process.env.PORT || "8080", 10);
 app.listen(PORT, () => {
