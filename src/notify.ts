@@ -1,51 +1,91 @@
-import nodemailer from "nodemailer";
+// src/notify.ts
+import { env } from "./config/env";
 
-async function sendTelegram(text: string) {
-    const token = process.env.TELEGRAM_BOT_TOKEN;
-    const chatId = process.env.TELEGRAM_CHAT_ID;
-    if (!token || !chatId) return false;
-    const url = `https://api.telegram.org/bot${token}/sendMessage`;
-    await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type":"application/json" },
-        body: JSON.stringify({ chat_id: chatId, text })
-    });
-    return true;
+export type NotifyTarget = {
+    email?: string;
+    sms?: string; // reserved for future use
+    telegram_chat_id?: string;
+};
+
+export type NotifyPayload = {
+    notify?: NotifyTarget;
+    text: string;
+    priority?: "info" | "warn" | "urgent";
+};
+
+async function sendTelegram(text: string, chatId: string) {
+    if (!env.telegram) {
+        throw new Error("Telegram is not configured");
+    }
+
+    const resp = await fetch(
+        `https://api.telegram.org/bot${env.telegram.botToken}/sendMessage`,
+        {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ chat_id: chatId, text })
+        }
+    );
+
+    if (!resp.ok) {
+        const body = await resp.text();
+        throw new Error(`Telegram sendMessage failed: ${resp.status} ${body}`);
+    }
 }
 
-export async function sendEmail({
-                                    to,
-                                    subject,
-                                    text
-                                }: { to: string; subject: string; text: string }) {
-    const host = process.env.SMTP_HOST!;
-    const port = parseInt(process.env.SMTP_PORT || "465", 10);
-    const user = process.env.SMTP_USER!;
-    const pass = process.env.SMTP_PASS!;
-    const from = process.env.EMAIL_FROM!;
+async function sendEmail(to: string, text: string) {
+    if (!env.smtp) {
+        throw new Error("SMTP is not configured");
+    }
 
+    const { host, port, user, pass, from } = env.smtp;
+    const nodemailer = await import("nodemailer");
     const transporter = nodemailer.createTransport({
-        host, port, secure: port === 465,
+        host,
+        port,
+        secure: port === 465,
         auth: { user, pass }
     });
 
-    await transporter.sendMail({ from, to, subject, text });
+    await transporter.sendMail({
+        from,
+        to,
+        subject: "UBC Tennis Booker",
+        text
+    });
 }
 
-export async function notifyAny({
-                                    emailTo,
-                                    text
-                                }: { emailTo?: string; text: string }) {
-    // Try Telegram first (if configured)
-    const teleOK = await sendTelegram(text).catch(() => false);
-    if (teleOK) return;
+/**
+ * High-level notify entrypoint used by /notify route.
+ * - Prefers Telegram (user chat_id, then default env chat ID)
+ * - Falls back to email (user email, then EMAIL_TO/EMAIL_FROM)
+ */
+export async function notify(payload: NotifyPayload) {
+    const { notify, text } = payload;
 
-    // Fallback to email if Telegram not configured
-    if (emailTo && process.env.SMTP_USER && process.env.SMTP_PASS) {
-        await sendEmail({ to: emailTo, subject: "UBC Tennis Booker", text });
-        return;
+    // 1) Telegram path
+    if (env.telegram) {
+        const userChat = notify?.telegram_chat_id?.trim();
+        const defaultChat = env.telegram.chatId?.trim();
+        const chatId = userChat || defaultChat;
+
+        if (chatId) {
+            await sendTelegram(text, chatId);
+            return { via: "telegram" as const, chat_id: chatId };
+        }
     }
-    if (process.env.EMAIL_TO && process.env.SMTP_USER && process.env.SMTP_PASS) {
-        await sendEmail({ to: process.env.EMAIL_TO, subject: "UBC Tennis Booker", text });
+
+    // 2) Email fallback path
+    if (env.smtp) {
+        const to = (notify?.email || env.smtp.to || "").trim();
+        if (to) {
+            await sendEmail(to, text);
+            return { via: "email" as const, to };
+        }
     }
+
+    // 3) Nothing available
+    throw new Error(
+        "No notifier configured or no recipient provided (Telegram and SMTP both unavailable)."
+    );
 }

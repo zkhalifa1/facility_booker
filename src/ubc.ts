@@ -1,4 +1,6 @@
+// src/ubc.ts
 import { chromium, BrowserContext, Page } from "playwright";
+import { env } from "./config/env";
 
 export type Preferences = {
     days_ahead?: number;
@@ -18,9 +20,10 @@ export type Slot = {
     deep_link: string | null;
 };
 
-const BASE_URL =
-    process.env.UBC_BASE_URL ??
+const DEFAULT_BASE_URL =
     "https://ubc.perfectmind.com/24063/Clients/BookMe4FacilityList/List?calendarId=e65c1527-c4f8-4316-b6d6-3b174041f00e&widgetId=c7c36ee3-2494-4de2-b2cb-d50a86487656&embed=False&singleCalendarWidget=true";
+
+const BASE_URL = env.ubc.baseUrl ?? DEFAULT_BASE_URL;
 
 // Handles: URL1 → URL2 (Login Portal) → URL3 (CWL) → URL4 (back to courts list)
 async function ensureLoggedIn(
@@ -86,19 +89,16 @@ async function ensureLoggedIn(
     }
 
     // --- URL3: CWL Authentication – fill username/password ---
-    const user = process.env.UBC_USER || "";
-    const pass = process.env.UBC_PASS || "";
-    if (!user || !pass) {
-        throw new Error("UBC_USER and UBC_PASS must be set in environment");
-    }
+    const user = env.ubc.user;
+    const pass = env.ubc.pass;
 
     console.log("[ubc] Looking for CWL username/password fields (URL3)…");
 
     const usernameLocator = authPage.locator(
-        'input[name="username"], #username, input[id*="Login"], input[id*="User"]'
+        'input[name="username"], #username, input[id*="Login"], input[id*="User"], input[name="j_username"]'
     );
     const passwordLocator = authPage.locator(
-        'input[name="password"], #password, input[type="password"]'
+        'input[name="password"], #password, input[type="password"], input[name="j_password"]'
     );
 
     await usernameLocator.waitFor({ timeout: 60000 });
@@ -115,7 +115,7 @@ async function ensureLoggedIn(
     console.log("[ubc] Submitting CWL form…");
     await submitButton.click();
 
-    // Wait for the SAML round-trip + redirect
+    // Wait for the SAML round-trip + redirect / Duo, etc.
     await authPage.waitForLoadState("networkidle", { timeout: 60000 });
 
     // --- Back to URL4: courts list (logged in) ---
@@ -166,4 +166,3 @@ export async function checkAvailability(prefs: Preferences): Promise<Slot[]> {
         await browser.close();
     }
 }
-
