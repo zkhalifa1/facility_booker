@@ -1,5 +1,5 @@
 // src/ubc.ts
-import { chromium, BrowserContext, Page } from "playwright";
+import { chromium, BrowserContext, Page, Locator } from "playwright";
 import { env } from "./config/env";
 
 export type Preferences = {
@@ -59,14 +59,14 @@ async function ensureLoggedIn(
     console.log("[ubc] Looking for 'CWL Login' button on Login Portal…");
 
     // Try a few robust selectors for the CWL button
-    const cwlButtonCandidates = [
+    const cwlButtonCandidates: Locator[] = [
         authPage.getByRole("button", { name: /cwl login/i }),
         authPage.getByRole("link", { name: /cwl login/i }),
         authPage.locator('a:has(img[alt*="CWL"])'),
         authPage.locator('img[alt*="CWL"]').locator("xpath=ancestor::a[1]")
     ];
 
-    let cwlButton: Page["locator"] | null = null;
+    let cwlButton: Locator | null = null;
     for (const candidate of cwlButtonCandidates) {
         if (await candidate.isVisible().catch(() => false)) {
             cwlButton = candidate;
