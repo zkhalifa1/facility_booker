@@ -1,6 +1,4 @@
-// src/ubc.ts
 import { chromium, BrowserContext, Page, Locator } from "playwright";
-import { env } from "./config/env";
 
 export type Preferences = {
     days_ahead?: number;
@@ -20,12 +18,11 @@ export type Slot = {
     deep_link: string | null;
 };
 
-const DEFAULT_BASE_URL =
+const BASE_URL =
+    process.env.UBC_BASE_URL ??
     "https://ubc.perfectmind.com/24063/Clients/BookMe4FacilityList/List?calendarId=e65c1527-c4f8-4316-b6d6-3b174041f00e&widgetId=c7c36ee3-2494-4de2-b2cb-d50a86487656&embed=False&singleCalendarWidget=true";
 
-const BASE_URL = env.ubc.baseUrl ?? DEFAULT_BASE_URL;
-
-// ---------- LOGIN FLOW (URL1 → URL2 → URL3 → URL4) ----------
+// ------------------------------ LOGIN FLOW ----------------------------------
 
 async function ensureLoggedIn(
     context: BrowserContext,
@@ -33,13 +30,12 @@ async function ensureLoggedIn(
 ): Promise<Page> {
     console.log("[ubc] Checking login state…");
 
-    // If there's no Login button/link in the header, assume we're already logged in
-    const loginButton = page
-        .getByRole("button", { name: /login/i })
-        .or(page.getByRole("link", { name: /login/i }))
-        .first();
+    // If the header has a visible "Login" button/link, we're NOT logged in.
+    const loginButton = page.locator('text=Login').first();
+    const loginVisible = await loginButton
+        .isVisible()
+        .catch(() => false);
 
-    const loginVisible = await loginButton.isVisible().catch(() => false);
     if (!loginVisible) {
         console.log("[ubc] Already logged in (no Login button visible)");
         return page;
@@ -51,15 +47,13 @@ async function ensureLoggedIn(
         loginButton.click()
     ]);
 
-    // If login opened a new tab, use that; otherwise continue on the same tab
     let authPage: Page = maybeNewPage ?? page;
-
     await authPage.waitForLoadState("domcontentloaded");
 
     // --- URL2: Login Portal – click "CWL Login" ---
     console.log("[ubc] Looking for 'CWL Login' button on Login Portal…");
 
-    const cwlButtonCandidates: Locator[] = [
+    const candidates: Locator[] = [
         authPage.getByRole("button", { name: /cwl login/i }),
         authPage.getByRole("link", { name: /cwl login/i }),
         authPage.locator('a:has(img[alt*="CWL"])'),
@@ -67,9 +61,10 @@ async function ensureLoggedIn(
     ];
 
     let cwlButton: Locator | null = null;
-    for (const candidate of cwlButtonCandidates) {
-        if (await candidate.isVisible().catch(() => false)) {
-            cwlButton = candidate;
+    for (const cand of candidates) {
+        const first = cand.first();
+        if (await first.isVisible().catch(() => false)) {
+            cwlButton = first;
             break;
         }
     }
@@ -89,16 +84,19 @@ async function ensureLoggedIn(
     }
 
     // --- URL3: CWL Authentication – fill username/password ---
-    const user = env.ubc.user;
-    const pass = env.ubc.pass;
+    const user = process.env.UBC_USER || "";
+    const pass = process.env.UBC_PASS || "";
+    if (!user || !pass) {
+        throw new Error("UBC_USER and UBC_PASS must be set in environment");
+    }
 
     console.log("[ubc] Looking for CWL username/password fields (URL3)…");
 
     const usernameLocator = authPage.locator(
-        'input[name="username"], #username, input[id*="Login"], input[id*="User"], input[name="j_username"]'
+        'input[name="username"], #username, input[id*="Login"], input[id*="User"]'
     );
     const passwordLocator = authPage.locator(
-        'input[name="password"], #password, input[type="password"], input[name="j_password"]'
+        'input[name="password"], #password, input[type="password"]'
     );
 
     await usernameLocator.waitFor({ timeout: 60000 });
@@ -115,7 +113,7 @@ async function ensureLoggedIn(
     console.log("[ubc] Submitting CWL form…");
     await submitButton.click();
 
-    // Wait for the SAML round-trip + redirect / Duo, etc.
+    // Wait for SAML + Duo + redirect chain to finish.
     await authPage.waitForLoadState("networkidle", { timeout: 60000 });
 
     // --- Back to URL4: courts list (logged in) ---
@@ -132,246 +130,281 @@ async function ensureLoggedIn(
     return authPage;
 }
 
-// ---------- COURT & SLOT SCANNING HELPERS ----------
+// ------------------------ SCHEDULER PARSING HELPERS -------------------------
 
-async function inferCourtName(chooseButton: Locator): Promise<string> {
-    try {
-        // Try to grab some surrounding text for a human-friendly name
-        const card = chooseButton.locator("xpath=ancestor::div[1]");
-        const text = (await card.innerText()).trim();
-        const firstLine =
-            text
-                .split("\n")
-                .map((t) => t.trim())
-                .filter(Boolean)[0] ?? "";
-        return firstLine || "Unknown court";
-    } catch {
-        return "Unknown court";
-    }
-}
-
-function getDesiredMinutes(prefs: Preferences): number {
-    const requested = prefs.min_minutes ?? 60;
-    if (requested <= 60) return 60;
-    return 120;
-}
-
-function parseTimeFromText(raw: string): string | null {
-    const text = raw.trim();
-    if (!text) return null;
-
-    const m = text.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+function to24h(time12: string): string | null {
+    // "03:00 PM" -> "15:00"
+    const m = time12.trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
     if (!m) return null;
-
-    let hour = parseInt(m[1], 10);
-    const minute = m[2];
-    const ampm = m[3].toUpperCase();
-
-    if (ampm === "PM" && hour !== 12) hour += 12;
-    if (ampm === "AM" && hour === 12) hour = 0;
-
-    const hh = hour.toString().padStart(2, "0");
-    return `${hh}:${minute}`;
+    let [_, hh, mm, ampm] = m;
+    let h = parseInt(hh, 10);
+    const isPM = ampm.toUpperCase() === "PM";
+    if (h === 12 && !isPM) h = 0; // 12 AM -> 00
+    else if (h !== 12 && isPM) h += 12; // 1–11 PM -> 13–23
+    return `${h.toString().padStart(2, "0")}:${mm}`;
 }
 
+function durationMinutes(start24: string, end24: string): number {
+    const [sh, sm] = start24.split(":").map(Number);
+    const [eh, em] = end24.split(":").map(Number);
+    return (eh * 60 + em) - (sh * 60 + sm);
+}
 
-
-async function scanSingleCourtPage(
+/**
+ * On a facility page, scan for
+ *   <span title="03:00 PM-04:00 PM">Book Now</span>
+ * tiles and turn them into Slot objects.
+ */
+async function extractSlotsFromScheduler(
     page: Page,
     prefs: Preferences,
-    courtName: string
+    courtLabel: string
 ): Promise<Slot[]> {
     const slots: Slot[] = [];
 
-    // Give the page a moment to render the scheduler.
-    await page.waitForTimeout(2000).catch(() => {});
+    // Every “Book Now” span under the scheduler’s booking template.
+    const bookNowSpans = page
+        .locator("#scheduler .k-event-template.facility-booking-slot span")
+        .filter({ hasText: /Book Now/i });
 
-    // Try to find the scheduler table by looking for time labels like '8:00 AM'.
-    const tables = page.locator("table");
-    const tableCount = await tables.count();
-    let gridTable: Locator | null = null;
-
-    for (let i = 0; i < tableCount; i++) {
-        const t = tables.nth(i);
-        const snippet = (await t.innerText().catch(() => "")).slice(0, 500);
-        if (/8:00 AM|9:00 AM|10:00 PM|Bookable 24hrs in advance/i.test(snippet)) {
-            gridTable = t;
-            break;
-        }
-    }
-
-    if (!gridTable) {
-        console.log(
-            `[ubc] No obvious scheduler table found on court "${courtName}"; skipping`
-        );
-        await debugListClickable(page);
-        return slots;
-    }
-
-    const rows = gridTable.locator("tr");
-    const rowCount = await rows.count();
+    const count = await bookNowSpans.count();
     console.log(
-        `[ubc] Scheduler table found on "${courtName}" with ${rowCount} rows`
+        `[ubc] Found ${count} "Book Now" spans on court "${courtLabel}"`
     );
 
-    const todayIso = new Date().toISOString().slice(0, 10);
-    const prefsStart = prefs.start_hour ?? 0;
-    const prefsEnd = prefs.end_hour ?? 24;
-    const minutes = prefs.min_minutes ?? 60;
+    for (let i = 0; i < count; i++) {
+        const span = bookNowSpans.nth(i);
+        
+        // First check if the span is actually visible
+        const isVisible = await span.isVisible().catch(() => false);
+        if (!isVisible) {
+            console.log(`[ubc] Skipping span ${i + 1}/${count} on "${courtLabel}": not visible`);
+            continue;
+        }
+        
+        // Verify the text content is actually "Book Now" (case-insensitive)
+        const textContent = (await span.innerText().catch(() => "")).trim();
+        if (!/^book\s+now$/i.test(textContent)) {
+            console.log(`[ubc] Skipping span ${i + 1}/${count} on "${courtLabel}": text content "${textContent}" doesn't match "Book Now"`);
+            continue;
+        }
+        
+        // Check if the slot is actually available/bookable
+        // Look for parent elements that might indicate unavailable/booked slots
+        const isAvailable = await span.evaluate((el) => {
+            const parent = (el as HTMLElement).closest('.facility-booking-slot, .k-event-template, [class*="event"]');
+            if (!parent) return true; // If no parent found, assume available
+            
+            // Check for disabled/unavailable indicators in class names
+            const classes = parent.className || '';
+            const hasUnavailable = /unavailable|disabled|booked|reserved|full|past|expired/i.test(classes);
+            
+            // Check if parent is visible and not hidden
+            const style = window.getComputedStyle(parent);
+            const isHidden = style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity) < 0.1;
+            
+            // Check for pointer-events: none (indicates not clickable)
+            const hasNoPointerEvents = style.pointerEvents === 'none';
+            
+            // Check if parent has aria-disabled or disabled attribute
+            const isDisabled = parent.hasAttribute('disabled') || parent.getAttribute('aria-disabled') === 'true';
+            
+            return !hasUnavailable && !isHidden && !hasNoPointerEvents && !isDisabled;
+        });
+        
+        if (!isAvailable) {
+            console.log(`[ubc] Skipping span ${i + 1}/${count} on "${courtLabel}": slot appears unavailable/disabled`);
+            continue;
+        }
+        
+        const titleAttr = (await span.getAttribute("title")) || "";
+        console.log(`[ubc] Processing span ${i + 1}/${count} on "${courtLabel}": title="${titleAttr}"`);
 
-    for (let i = 0; i < rowCount; i++) {
-        const row = rows.nth(i);
-
-        // First cell in row should be the time label (e.g., "10:00 PM")
-        const timeCell = row.locator("th, td").first();
-        const rawTime = (await timeCell.innerText().catch(() => "")).trim();
-
-        const time24h = parseTimeFromText(rawTime);
-        if (!time24h) {
-            // Header row or something else – skip
+        // e.g. "03:00 PM-04:00 PM"
+        const match = titleAttr.match(
+            /([0-9]{1,2}:[0-9]{2}\s*(?:AM|PM))\s*-\s*([0-9]{1,2}:[0-9]{2}\s*(?:AM|PM))/
+        );
+        if (!match) {
+            console.warn(
+                `[ubc] Could not parse time range from title="${titleAttr}" on "${courtLabel}"`
+            );
             continue;
         }
 
-        // Respect user hour preferences
-        const [hhStr] = time24h.split(":");
-        const hh = parseInt(hhStr, 10);
-        if (hh < prefsStart || hh >= prefsEnd) continue;
+        const start24 = to24h(match[1]);
+        const end24 = to24h(match[2]);
+        if (!start24 || !end24) {
+            console.warn(
+                `[ubc] Failed 12h→24h conversion for title="${titleAttr}" on "${courtLabel}" (start24=${start24}, end24=${end24})`
+            );
+            continue;
+        }
 
-        // Does this row contain a "Book Now" button?
-        const bookNowInRow = row.locator(
-            'button:has-text("Book Now"), a:has-text("Book Now"), div:has-text("Book Now")'
-        );
-        const bookNowCount = await bookNowInRow.count();
+        const mins = durationMinutes(start24, end24);
+        console.log(`[ubc] Parsed time: ${start24}-${end24} (${mins} minutes)`);
 
-        if (bookNowCount === 0) continue;
+        // --- Apply preferences (time window + min duration) ---
+        if (prefs.start_hour !== undefined) {
+            const h = parseInt(start24.split(":")[0], 10);
+            if (h < prefs.start_hour) {
+                console.log(`[ubc] Filtered out: start hour ${h} < ${prefs.start_hour}`);
+                continue;
+            }
+        }
+        if (prefs.end_hour !== undefined) {
+            const h = parseInt(start24.split(":")[0], 10);
+            if (h >= prefs.end_hour) {
+                console.log(`[ubc] Filtered out: start hour ${h} >= ${prefs.end_hour}`);
+                continue;
+            }
+        }
+        if (prefs.min_minutes !== undefined && mins < prefs.min_minutes) {
+            console.log(`[ubc] Filtered out: duration ${mins} < ${prefs.min_minutes}`);
+            continue;
+        }
 
-        console.log(
-            `[ubc] Row "${rawTime}" on "${courtName}" has ${bookNowCount} "Book Now" cell(s)`
-        );
-
-        // For now we don't distinguish columns/dates – we treat them as "today+X".
-        // We'll refine the date later if needed.
-        slots.push({
-            date_iso: todayIso,
-            time_24h: time24h,
-            minutes,
-            location: courtName || "UBC Tennis Centre – court",
-            deep_link: page.url()
+        // Try to get an ISO date from an ancestor with data-date (if present).
+        const dateIso = await span.evaluate((el) => {
+            const dateNode =
+                (el as HTMLElement).closest<HTMLElement>("[data-date]");
+            const raw = dateNode?.getAttribute("data-date") || "";
+            if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+            return "";
         });
+
+        const date_iso =
+            dateIso && /^\d{4}-\d{2}-\d{2}$/.test(dateIso)
+                ? dateIso
+                : new Date().toISOString().slice(0, 10);
+
+        const slot = {
+            date_iso,
+            time_24h: start24,
+            minutes: mins,
+            location: courtLabel,
+            deep_link: page.url()
+        };
+        console.log(`[ubc] Adding slot: ${JSON.stringify(slot)}`);
+        slots.push(slot);
     }
 
+    console.log(`[ubc] Extracted ${slots.length} slots from ${count} "Book Now" spans on "${courtLabel}"`);
     return slots;
 }
 
-
-
-
- // Helper function to debug the program. Doesnt change behaviour, just prints out a bunch of useful statements
-async function debugListClickable(page: Page) {
-    console.log("[ubc-debug] No 'Choose' buttons found. Listing clickable elements…");
-
-    const clickable = page.locator("button, a, [role='button'], input[type='button'], input[type='submit']");
-    const count = await clickable.count();
-    console.log(`[ubc-debug] Found ${count} clickable elements (button/a/input)`);
-
-    const sampleCount = Math.min(count, 30);
-    for (let i = 0; i < sampleCount; i++) {
-        const el = clickable.nth(i);
-        const tag = await el.evaluate((n) => n.tagName).catch(() => "UNKNOWN");
-        const role = await el.getAttribute("role").catch(() => null);
-        const text = (await el.innerText().catch(() => "")).trim();
-        const valueAttr = (await el.getAttribute("value").catch(() => null)) || "";
-        console.log(
-            `[ubc-debug] [${i}] tag=${tag} role=${role ?? "none"} text="${text}" value="${valueAttr}"`
-        );
-    }
-}
-
+// ------------------------ COURT LIST SCANNING -------------------------------
 
 async function scanCourtsAndSlots(
+    context: BrowserContext,
     page: Page,
     prefs: Preferences
 ): Promise<Slot[]> {
-    const slots: Slot[] = [];
+    const allSlots: Slot[] = [];
 
-    // Always re-query on the current page so indexes stay valid
-    const chooseButtons = page.locator(
-        'button:has-text("Choose"), a:has-text("Choose")'
-    ).or(page.getByRole("button", { name: /choose/i }));
+    // Select only desktop "Choose" buttons to avoid duplicates (each court has desktop + tablet versions)
+    const chooseButtons = page.locator('a.pm-confirm-button.desktop-details:has-text("Choose")');
+    const count = await chooseButtons.count();
+    console.log(`[ubc] Found ${count} court 'Choose' buttons (desktop only)`);
 
-    const totalCourts = await chooseButtons.count();
-    console.log(`[ubc] Found ${totalCourts} court 'Choose' buttons`);
-
-    if (totalCourts === 0) {
-        console.log("[ubc] No courts detected from current selectors");
-        await debugListClickable(page);
-        return slots;
-    }
-
-    const maxCourts = Math.min(totalCourts, 10);
-
-    for (let i = 0; i < maxCourts; i++) {
-        // Re-evaluate locator each loop
+    const limit = Math.min(count, 10); // sanity cap
+    for (let i = 0; i < limit; i++) {
         const button = chooseButtons.nth(i);
-        const courtName = await inferCourtName(button); // ok if this just returns "Choose"
 
-        console.log(
-            `[ubc] Scanning court ${i + 1}/${maxCourts}: "${courtName}"…`
-        );
-
+        // Extract court label from the facility-item container
+        // The structure is: .facility-item > .facility-details > h2 (contains "Court 01", etc.)
+        let courtLabel = `Court ${i + 1}`;
         try {
-            const href = await button.getAttribute("href");
-
-            if (!href) {
-                console.log(
-                    `[ubc] Court "${courtName}" has no href; falling back to direct click`
-                );
-                await button.click();
-            } else {
-                const facilityUrl = new URL(href, BASE_URL).toString();
-                console.log(
-                    `[ubc] Navigating to facility page for court "${courtName}", URL: ${facilityUrl}`
-                );
-                await page.goto(facilityUrl, { waitUntil: "domcontentloaded" });
+            // Navigate from button up to the facility-item container, then find .facility-details h2
+            const facilityItem = button.locator('xpath=ancestor::div[contains(@class,"facility-item")]').first();
+            
+            if (await facilityItem.isVisible().catch(() => false)) {
+                const heading = facilityItem.locator('.facility-details h2').first();
+                if (await heading.isVisible().catch(() => false)) {
+                    const text = (await heading.innerText()).trim();
+                    if (text) courtLabel = text;
+                }
             }
-
-            const courtSlots = await scanSingleCourtPage(page, prefs, courtName);
-            slots.push(...courtSlots);
-        } catch (err: any) {
-            console.warn(
-                `[ubc] Error while scanning court "${courtName}":`,
-                err?.message || String(err)
-            );
+        } catch {
+            // fall back to default
         }
 
-        // Go back to main court list for the next iteration
         console.log(
-            `[ubc] Returning to courts list after scanning "${courtName}"…`
+            `[ubc] Scanning court ${i + 1}/${limit}: "${courtLabel}"…`
         );
-        try {
-            await page.goto(BASE_URL, { waitUntil: "domcontentloaded" });
-        } catch (err: any) {
-            console.warn(
-                "[ubc] Error returning to courts list; stopping court scan loop:",
-                err?.message || String(err)
+
+        // Build a facility URL from the button's href if present.
+        let facilityUrl: string;
+        const href = await button.getAttribute("href");
+        if (href) {
+            facilityUrl = new URL(href, BASE_URL).toString();
+        } else {
+            // Fallback: click and wait for navigation
+            console.log(
+                `[ubc] No href on court button "${courtLabel}", clicking instead…`
             );
-            break;
+            await Promise.all([
+                page.waitForNavigation({ waitUntil: "networkidle" }),
+                button.click()
+            ]);
+            facilityUrl = page.url();
         }
+
+        console.log(
+            `[ubc] Navigating to facility page for court "${courtLabel}", URL: ${facilityUrl}`
+        );
+        await page.goto(facilityUrl, { waitUntil: "networkidle" });
+
+        // Extract the actual court name from the facility page
+        try {
+            const facilityNameHeading = page.locator('h1.facility-name').first();
+            if (await facilityNameHeading.isVisible({ timeout: 5000 }).catch(() => false)) {
+                const extractedName = (await facilityNameHeading.innerText()).trim();
+                if (extractedName) {
+                    console.log(`[ubc] Found court name on facility page: "${extractedName}"`);
+                    courtLabel = extractedName;
+                }
+            }
+        } catch (err) {
+            console.warn(`[ubc] Could not extract court name from facility page, using "${courtLabel}"`);
+        }
+
+        // Optional debug: how many table rows in the scheduler
+        const rowCount = await page
+            .locator('#scheduler tr[role="row"], #scheduler .k-scheduler-row')
+            .count()
+            .catch(() => 0);
+        if (rowCount > 0) {
+            console.log(
+                `[ubc] Scheduler table found on "${courtLabel}" with ${rowCount} rows`
+            );
+        }
+
+        const slotsHere = await extractSlotsFromScheduler(
+            page,
+            prefs,
+            courtLabel
+        );
+        allSlots.push(...slotsHere);
+
+        // Go back to courts list for the next court
+        // Note: Don't call ensureLoggedIn here - session is maintained via cookies
+        await page.goto(BASE_URL, { waitUntil: "networkidle" });
     }
 
-    console.log(`[ubc] Total candidate slots found across courts: ${slots.length}`);
-    return slots;
+    console.log(
+        `[ubc] Total candidate slots found across courts: ${allSlots.length}`
+    );
+    return allSlots;
 }
 
+// ----------------------------- PUBLIC API -----------------------------------
 
-
-
-// ---------- PUBLIC ENTRY POINT USED BY /check_now ----------
-
-export async function checkAvailability(prefs: Preferences): Promise<Slot[]> {
+export async function checkAvailability(
+    prefs: Preferences
+): Promise<Slot[]> {
     const browser = await chromium.launch({ headless: true });
-    const context: BrowserContext = await browser.newContext();
-    let page: Page = await context.newPage();
+    const context = await browser.newContext();
+    let page = await context.newPage();
 
     try {
         console.log("[ubc] Navigating to booking page…");
@@ -380,22 +413,22 @@ export async function checkAvailability(prefs: Preferences): Promise<Slot[]> {
         // Make sure we are logged in and back on the courts list
         page = await ensureLoggedIn(context, page);
 
-        try {
-            const realSlots = await scanCourtsAndSlots(page, prefs);
-            if (realSlots.length > 0) {
-                console.log("[ubc] Returning real scanned slots");
-                return realSlots;
-            }
-            console.log("[ubc] No slots found by scanner; falling back to stub");
-        } catch (scanErr: any) {
-            console.error(
-                "[ubc] Error during scanCourtsAndSlots; falling back to stub:",
-                scanErr?.message || String(scanErr)
+        const slots = await scanCourtsAndSlots(context, page, prefs);
+
+        if (slots.length > 0) {
+            // Sort by date + time just to be nice
+            slots.sort((a, b) =>
+                a.date_iso === b.date_iso
+                    ? a.time_24h.localeCompare(b.time_24h)
+                    : a.date_iso.localeCompare(b.date_iso)
             );
+            return slots;
         }
 
-        // Fallback: stub slot so the API still behaves nicely
+        // Fallback stub if nothing matched
         const todayIso = new Date().toISOString().slice(0, 10);
+        console.log("[ubc] No slots found by scanner; falling back to stub");
+
         return [
             {
                 date_iso: todayIso,
