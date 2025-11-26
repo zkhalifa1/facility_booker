@@ -1,7 +1,7 @@
 // src/index.ts
 import express, { Request, Response, NextFunction } from "express";
 import { z } from "zod";
-import { checkAvailability } from "./ubc";
+import { checkAvailability, bookSlot, type BookingRequest } from "./ubc";
 import { notify as notifyService, type NotifyPayload } from "./notify";
 import { env } from "./config/env";
 
@@ -86,6 +86,42 @@ app.post("/notify", requireBearer, async (req: Request, res: Response) => {
         console.error("Notify error:", err?.message || err);
         return res.status(502).json({
             error: "Notify failed",
+            detail: String(err?.message || err)
+        });
+    }
+});
+
+// --- Booking Schema ---
+const BookingRequestSchema = z.object({
+    facility_url: z.string().url(),
+    time_24h: z.string().regex(/^\d{2}:\d{2}$/, "Time must be in HH:MM format"),
+    duration_hours: z.union([z.literal(1), z.literal(2)]),
+    num_people: z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4)])
+});
+
+// --- /book ---
+app.post("/book", requireBearer, async (req: Request, res: Response) => {
+    try {
+        const parsed = BookingRequestSchema.parse(req.body) as BookingRequest;
+
+        console.log("Booking request:", parsed);
+        const result = await bookSlot(parsed);
+
+        if (result.success) {
+            return res.json({
+                ok: true,
+                ...result
+            });
+        } else {
+            return res.status(400).json({
+                ok: false,
+                error: result.message
+            });
+        }
+    } catch (err: any) {
+        console.error("Book error:", err?.message || err);
+        return res.status(400).json({
+            error: "Booking failed",
             detail: String(err?.message || err)
         });
     }

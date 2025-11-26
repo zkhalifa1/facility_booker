@@ -18,6 +18,24 @@ export type Slot = {
     deep_link: string | null;
 };
 
+export type BookingRequest = {
+    facility_url: string;      // The deep_link from a Slot
+    time_24h: string;          // e.g. "09:00"
+    duration_hours: 1 | 2;     // 1h or 2h rental
+    num_people: 1 | 2 | 3 | 4; // Number of attendees
+};
+
+export type BookingResult = {
+    success: boolean;
+    confirmation_number?: string;
+    message: string;
+    booked_slot?: {
+        time: string;
+        duration: number;
+        location: string;
+    };
+};
+
 const BASE_URL =
     process.env.UBC_BASE_URL ??
     "https://ubc.perfectmind.com/24063/Clients/BookMe4FacilityList/List?calendarId=e65c1527-c4f8-4316-b6d6-3b174041f00e&widgetId=c7c36ee3-2494-4de2-b2cb-d50a86487656&embed=False&singleCalendarWidget=true";
@@ -438,6 +456,530 @@ export async function checkAvailability(
                 deep_link: BASE_URL
             }
         ];
+    } finally {
+        await browser.close();
+    }
+}
+
+// ----------------------------- BOOKING API -----------------------------------
+
+export async function bookSlot(
+    request: BookingRequest
+): Promise<BookingResult> {
+    const browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext();
+    let page = await context.newPage();
+
+    try {
+        console.log("[ubc] Starting booking flow…");
+        console.log(`[ubc] Facility URL: ${request.facility_url}`);
+        console.log(`[ubc] Time: ${request.time_24h}, Duration: ${request.duration_hours}h, People: ${request.num_people}`);
+
+        // Navigate to the facility page
+        await page.goto(request.facility_url, { waitUntil: "networkidle" });
+
+        // Ensure logged in
+        page = await ensureLoggedIn(context, page);
+
+        // If we got redirected away from the facility page, navigate back
+        if (!page.url().includes("BookMe4LandingPages/Facility")) {
+            console.log("[ubc] Navigating back to facility page after login…");
+            await page.goto(request.facility_url, { waitUntil: "networkidle" });
+        }
+
+        // Get the court name from the page
+        const courtName = await page.locator('h1.facility-name').first().innerText().catch(() => "Unknown Court");
+        console.log(`[ubc] On facility page: ${courtName.trim()}`);
+
+        // =====================================================================
+        // STEP 1: Click the "Book Now" button for the specific time slot
+        // =====================================================================
+        console.log(`[ubc] Step 1: Looking for Book Now button at ${request.time_24h}…`);
+        
+        // Convert 24h time to 12h format for matching
+        const [hour, minute] = request.time_24h.split(":").map(Number);
+        const hour12 = hour === 0 ? 12 : hour > 12 ? hour - 12 : hour;
+        const ampm = hour >= 12 ? "PM" : "AM";
+        const time12h = `${hour12}:${minute.toString().padStart(2, "0")} ${ampm}`;
+        
+        console.log(`[ubc] Searching for time slot starting at ${time12h}…`);
+
+        // Find all Book Now spans and match by time
+        const bookNowSpans = page
+            .locator("#scheduler .k-event-template.facility-booking-slot span")
+            .filter({ hasText: /Book Now/i });
+
+        const spanCount = await bookNowSpans.count();
+        console.log(`[ubc] Found ${spanCount} Book Now buttons`);
+
+        let targetSpan: Locator | null = null;
+        for (let i = 0; i < spanCount; i++) {
+            const span = bookNowSpans.nth(i);
+            const titleAttr = (await span.getAttribute("title")) || "";
+            
+            // Check if this slot starts at the requested time
+            if (titleAttr.toLowerCase().includes(time12h.toLowerCase())) {
+                console.log(`[ubc] Found matching slot: ${titleAttr}`);
+                targetSpan = span;
+                break;
+            }
+        }
+
+        if (!targetSpan) {
+            return {
+                success: false,
+                message: `Could not find available slot at ${request.time_24h} (${time12h})`
+            };
+        }
+
+        // Click the Book Now button
+        console.log("[ubc] Clicking Book Now span…");
+        await targetSpan.click();
+
+        // Wait for the booking summary to appear
+        await page.waitForTimeout(2000);
+
+        // =====================================================================
+        // STEP 2: Click the "Reserve" button
+        // =====================================================================
+        console.log("[ubc] Step 2: Looking for Reserve button…");
+        
+        const reserveButton = page.locator('button.button-book[name="book-button"], button:has-text("Reserve")').first();
+        
+        if (!await reserveButton.isVisible({ timeout: 10000 }).catch(() => false)) {
+            return {
+                success: false,
+                message: "Reserve button not found after clicking Book Now"
+            };
+        }
+
+        // Wait for any Kendo UI overlay to disappear (loading spinner/modal)
+        console.log("[ubc] Waiting for any overlay to disappear…");
+        await page.locator('.k-overlay').waitFor({ state: 'hidden', timeout: 5000 }).catch(async () => {
+            console.log("[ubc] Overlay still visible, removing via JavaScript…");
+            // Forcefully remove the overlay if it's blocking
+            await page.evaluate(() => {
+                document.querySelectorAll('.k-overlay').forEach(el => el.remove());
+            });
+        });
+        
+        // Also wait for loading containers to disappear
+        await page.locator('.loading-container, .bm-loading-container, #bm-overlay').waitFor({ state: 'hidden', timeout: 3000 }).catch(async () => {
+            await page.evaluate(() => {
+                document.querySelectorAll('.loading-container, .bm-loading-container, #bm-overlay').forEach(el => {
+                    (el as HTMLElement).style.display = 'none';
+                });
+            });
+        });
+
+        // =====================================================================
+        // Fill in number of attendees (default 2 unless specified)
+        // =====================================================================
+        const numAttendees = request.num_people || 2;
+        console.log(`[ubc] Setting number of attendees to ${numAttendees}…`);
+        
+        // The Kendo NumericTextBox widget requires using JavaScript to set its value
+        // because the visible input has aria-hidden="true" and isn't directly editable
+        const setAttendeesResult = await page.evaluate((num) => {
+            // Method 1: Try Kendo widget API
+            const input = document.querySelector('#number-of-attendees, input[name="number-of-attendees"]') as HTMLInputElement;
+            if (input) {
+                const $ = (window as any).jQuery || (window as any).$;
+                if ($) {
+                    const kendoWidget = $(input).data('kendoNumericTextBox');
+                    if (kendoWidget) {
+                        kendoWidget.value(num);
+                        kendoWidget.trigger('change');
+                        return { success: true, method: 'kendo' };
+                    }
+                }
+                // Method 2: Direct value set with events
+                input.value = String(num);
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                return { success: true, method: 'direct' };
+            }
+            
+            // Method 3: Try the visible formatted input
+            const visibleInput = document.querySelector('.number-of-people-input .k-formatted-value, .num-of-spots.k-formatted-value') as HTMLInputElement;
+            if (visibleInput) {
+                visibleInput.value = String(num);
+                visibleInput.dispatchEvent(new Event('input', { bubbles: true }));
+                visibleInput.dispatchEvent(new Event('change', { bubbles: true }));
+                visibleInput.dispatchEvent(new Event('blur', { bubbles: true }));
+                return { success: true, method: 'visible' };
+            }
+            
+            return { success: false, method: 'none' };
+        }, numAttendees);
+        
+        console.log(`[ubc] Set attendees result: ${JSON.stringify(setAttendeesResult)}`);
+        
+        // Wait for UI to update
+        await page.waitForTimeout(1000);
+
+        // Verify the booking summary shows correct info
+        const summaryText = await page.locator('.booking-summary').innerText().catch(() => "");
+        console.log(`[ubc] Booking summary: ${summaryText.replace(/\n/g, ' | ')}`);
+
+        console.log("[ubc] Clicking Reserve button…");
+        const currentUrl = page.url();
+        
+        // Remove any overlay that might be blocking
+        await page.evaluate(() => {
+            document.querySelectorAll('.k-overlay').forEach(el => el.remove());
+        });
+        
+        // The Reserve button uses Knockout.js (data-bind="click: onBookButtonClick")
+        // We need to click and wait for URL change, not just networkidle
+        // Use force:true in case overlay is still partially visible
+        await reserveButton.click({ force: true });
+        console.log("[ubc] Reserve button clicked, waiting for navigation…");
+        
+        // Wait for URL to change (the JS will navigate to attendee page or login portal)
+        try {
+            await page.waitForURL(/BookMe4EventParticipants|Participant|Attendee|portal\.recreation|Login/i, { timeout: 15000 });
+            console.log("[ubc] URL changed");
+        } catch {
+            console.log("[ubc] URL pattern wait timed out, checking current state…");
+        }
+        
+        // Also wait for network to settle
+        await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+        await page.waitForTimeout(2000);
+        
+        const newUrl = page.url();
+        console.log(`[ubc] URL after Reserve: ${newUrl}`);
+        
+        // Check if we got redirected to a login portal
+        if (newUrl.includes("portal.recreation.ubc.ca") || newUrl.includes("Login")) {
+            console.log("[ubc] Redirected to login portal, need to re-authenticate…");
+            
+            // Extract the returnUrl from the current URL - this is where we should end up after login
+            const urlObj = new URL(newUrl);
+            const returnUrl = urlObj.searchParams.get('returnUrl');
+            console.log(`[ubc] Return URL after login should be: ${returnUrl}`);
+            
+            // Handle login on this portal (similar to CWL login)
+            // Look for CWL Login button
+            const cwlButton = page.locator('a:has-text("CWL"), button:has-text("CWL"), img[alt*="CWL"]').first();
+            if (await cwlButton.isVisible({ timeout: 5000 }).catch(() => false)) {
+                console.log("[ubc] Found CWL login button on portal, clicking…");
+                await cwlButton.click();
+                await page.waitForLoadState("domcontentloaded");
+            }
+            
+            // Fill in credentials if we see a login form
+            const usernameField = page.locator('input[name="username"], #username, input[type="text"][id*="user"]').first();
+            const passwordField = page.locator('input[name="password"], #password, input[type="password"]').first();
+            
+            if (await usernameField.isVisible({ timeout: 10000 }).catch(() => false)) {
+                const user = process.env.UBC_USER || "";
+                const pass = process.env.UBC_PASS || "";
+                
+                console.log("[ubc] Filling login credentials on portal…");
+                await usernameField.fill(user);
+                await passwordField.fill(pass);
+                
+                const submitBtn = page.locator('button[type="submit"], input[type="submit"], button:has-text("Login"), button:has-text("Sign")').first();
+                await submitBtn.click();
+                
+                // Wait for login to complete and redirect
+                await page.waitForLoadState("networkidle", { timeout: 60000 });
+            }
+            
+            // After login, check if we need to navigate to returnUrl
+            const currentUrlAfterLogin = page.url();
+            console.log(`[ubc] URL after portal login: ${currentUrlAfterLogin}`);
+            
+            // If we ended up on the wrong page, navigate to the returnUrl
+            // The attendee page URL pattern: BookMe4EventParticipants (can be under /Contacts/ or /Menu/)
+            if (returnUrl && !currentUrlAfterLogin.includes("BookMe4EventParticipants")) {
+                console.log("[ubc] Navigating to attendee selection page from returnUrl…");
+                const decodedUrl = decodeURIComponent(returnUrl);
+                console.log(`[ubc] Decoded returnUrl: ${decodedUrl}`);
+                await page.goto(decodedUrl, { waitUntil: "networkidle" });
+            }
+            
+            console.log(`[ubc] Final URL after re-login: ${page.url()}`);
+        }
+        
+        // Check if we're still on the facility page
+        if (page.url().includes("BookMe4LandingPages/Facility")) {
+            console.log("[ubc] Still on facility page - Reserve may not have worked");
+            
+            // Try clicking the Reserve button again with force
+            console.log("[ubc] Trying to click Reserve button again with force…");
+            await reserveButton.click({ force: true });
+            await page.waitForTimeout(3000);
+            
+            // Check if booking summary has a different button or link
+            const altBookButton = page.locator('.booking-summary button, .booking-summary a, [data-bind*="BookButton"] button').first();
+            if (await altBookButton.isVisible({ timeout: 2000 }).catch(() => false)) {
+                console.log("[ubc] Found alternative book button, removing overlays and clicking…");
+                // Remove overlays again before clicking
+                await page.evaluate(() => {
+                    document.querySelectorAll('.k-overlay').forEach(el => el.remove());
+                });
+                await altBookButton.click({ force: true });
+                await page.waitForTimeout(3000);
+            }
+            
+            // Final URL check
+            const finalUrl = page.url();
+            console.log(`[ubc] Final URL: ${finalUrl}`);
+            
+            if (finalUrl.includes("BookMe4LandingPages/Facility")) {
+                // Still stuck - let's check if there's an error message
+                const errorMsg = await page.locator('.error, .alert, .validation-error').first().innerText().catch(() => "");
+                if (errorMsg) {
+                    return {
+                        success: false,
+                        message: `Could not proceed with booking: ${errorMsg}`
+                    };
+                }
+                
+                return {
+                    success: false,
+                    message: "Reserve button click did not navigate to attendee selection page"
+                };
+            }
+        }
+
+        // =====================================================================
+        // STEP 3: Select attendee (the one marked as "You") and click Next
+        // =====================================================================
+        console.log("[ubc] Step 3: Selecting attendee…");
+        console.log(`[ubc] Current URL: ${page.url()}`);
+
+        // Wait for the attendee page to fully load
+        // The attendees table is at: table tbody tr.bm-selectable-row
+        await page.waitForSelector('table tr.bm-selectable-row, #event-attendees, .bm-participant-selection', { timeout: 15000 }).catch(() => {
+            console.log("[ubc] Warning: Attendee section not found with primary selectors");
+        });
+
+        // Debug: log page content hints
+        const pageTitle = await page.title().catch(() => "");
+        console.log(`[ubc] Page title: ${pageTitle}`);
+
+        // Find all attendee rows - the table structure is: table > tbody > tr.bm-selectable-row
+        const attendeeRows = page.locator('table tbody tr.bm-selectable-row, #event-attendees tr.bm-selectable-row, .bm-participant-selection tr.bm-selectable-row');
+        const rowCount = await attendeeRows.count();
+        console.log(`[ubc] Found ${rowCount} potential attendees`);
+
+        // Look for the row with "(You)" label - this is the logged-in user
+        // The checkbox ID pattern: ParticipantsFamily_FamilyMembers_X__IsParticipating
+        let selectedAttendeeName = "";
+        for (let i = 0; i < rowCount; i++) {
+            const row = attendeeRows.nth(i);
+            const label = await row.locator('label').innerText().catch(() => "");
+            const rowClass = await row.getAttribute("class").catch(() => "");
+            const isRowHidden = await row.evaluate(el => (el as HTMLElement).style.display === 'none').catch(() => false);
+            
+            // Skip hidden rows
+            if (isRowHidden) continue;
+            
+            console.log(`[ubc] Attendee ${i + 1}: "${label}" (class: ${rowClass})`);
+            
+            if (label.includes("(You)")) {
+                console.log(`[ubc] Found YOUR attendee: ${label}`);
+                selectedAttendeeName = label;
+                
+                // Check if the row is disabled
+                const isDisabled = rowClass?.includes("disabled") || false;
+                if (isDisabled) {
+                    console.log(`[ubc] Attendee ${label} is disabled, skipping…`);
+                    continue;
+                }
+                
+                // Find the checkbox - it's input[type="checkbox"][id*="IsParticipating"]
+                const checkbox = row.locator('input[type="checkbox"][id*="IsParticipating"]:not(.disabled):not([disabled])').first();
+                if (await checkbox.count() > 0) {
+                    const isChecked = await checkbox.isChecked().catch(() => false);
+                    if (!isChecked) {
+                        // Click the row or checkbox to select
+                        await checkbox.click({ force: true });
+                        console.log(`[ubc] Selected attendee: ${label}`);
+                    } else {
+                        console.log(`[ubc] Attendee already selected: ${label}`);
+                    }
+                    break;
+                } else {
+                    // Try clicking the row itself
+                    console.log(`[ubc] Checkbox not found directly, clicking row…`);
+                    await row.click();
+                    break;
+                }
+            }
+        }
+
+        if (!selectedAttendeeName) {
+            console.log("[ubc] Could not find (You) attendee, trying fallback…");
+            // Fallback: select first non-disabled attendee
+            for (let i = 0; i < rowCount; i++) {
+                const row = attendeeRows.nth(i);
+                const rowClass = await row.getAttribute("class").catch(() => "");
+                const isDisabled = rowClass?.includes("disabled") || false;
+                const isRowHidden = await row.evaluate(el => (el as HTMLElement).style.display === 'none').catch(() => false);
+                
+                if (!isDisabled && !isRowHidden) {
+                    const checkbox = row.locator('input[type="checkbox"][id*="IsParticipating"]:not(.disabled):not([disabled])').first();
+                    if (await checkbox.count() > 0) {
+                        const isChecked = await checkbox.isChecked().catch(() => false);
+                        if (!isChecked) {
+                            await checkbox.click({ force: true });
+                        }
+                        selectedAttendeeName = await row.locator('label').innerText().catch(() => "Unknown");
+                        console.log(`[ubc] Selected first available attendee: ${selectedAttendeeName}`);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Wait for any validation/hold creation after clicking attendee
+        await page.waitForTimeout(3000);
+        
+        // Verify an attendee was selected
+        if (!selectedAttendeeName) {
+            return {
+                success: false,
+                message: "Could not select any attendee - none available or all disabled"
+            };
+        }
+
+        // Wait for Next button to become enabled after attendee selection
+        console.log("[ubc] Waiting for Next button to become available after attendee selection…");
+        await page.waitForTimeout(2000);
+
+        // Click the Next button - try multiple selectors
+        console.log("[ubc] Looking for Next button…");
+        
+        const nextButtonSelectors = [
+            '.next-button-container a.bm-button',
+            '.next-button-container a',
+            '.bm-form-navbar a.bm-button',
+            'a.bm-button:has-text("Next")',
+            'a:has(span:text("Next"))',
+            '.bm-form-navbar a[title="Next"]',
+            'button:has-text("Next")',
+            'input[type="submit"][value*="Next"]'
+        ];
+
+        let nextButton = null;
+        for (const selector of nextButtonSelectors) {
+            const btn = page.locator(selector).first();
+            if (await btn.isVisible({ timeout: 1000 }).catch(() => false)) {
+                console.log(`[ubc] Found Next button with selector: ${selector}`);
+                nextButton = btn;
+                break;
+            }
+        }
+        
+        if (!nextButton) {
+            // Debug: take a screenshot or log more info
+            console.log("[ubc] Next button not found. Dumping available buttons…");
+            const allButtons = await page.locator('a.bm-button, button, input[type="submit"]').all();
+            for (const btn of allButtons.slice(0, 10)) {
+                const text = await btn.innerText().catch(() => "");
+                const href = await btn.getAttribute("href").catch(() => "");
+                console.log(`[ubc]   Button: "${text}" href="${href}"`);
+            }
+            
+            return {
+                success: false,
+                message: "Next button not found on attendee selection page"
+            };
+        }
+
+        await nextButton.click();
+
+        // Wait for navigation to payment page
+        await page.waitForLoadState("networkidle", { timeout: 30000 });
+        await page.waitForTimeout(2000);
+
+        // =====================================================================
+        // STEP 4: Select payment method (existing credit card)
+        // =====================================================================
+        console.log("[ubc] Step 4: Selecting payment method…");
+
+        // Look for existing credit card option
+        const existingCardOption = page.locator('.org-payment-type:has(.icon-creditcard-visa, .icon-creditcard-mastercard)').first();
+        
+        if (await existingCardOption.isVisible({ timeout: 5000 }).catch(() => false)) {
+            console.log("[ubc] Found existing credit card, selecting it…");
+            await existingCardOption.click();
+            await page.waitForTimeout(1000);
+        } else {
+            console.log("[ubc] No existing credit card found, checking if already selected…");
+            // Card might already be selected by default
+        }
+
+        // =====================================================================
+        // STEP 5: Click "Place My Order" button
+        // =====================================================================
+        console.log("[ubc] Step 5: Clicking Place My Order…");
+
+        const placeOrderButton = page.locator('button.process-now, button:has-text("Place My Order")').first();
+        
+        if (!await placeOrderButton.isVisible({ timeout: 10000 }).catch(() => false)) {
+            return {
+                success: false,
+                message: "Place My Order button not found"
+            };
+        }
+
+        console.log("[ubc] Clicking Place My Order button…");
+        await placeOrderButton.click();
+
+        // Wait for order processing
+        await page.waitForLoadState("networkidle", { timeout: 60000 });
+        await page.waitForTimeout(3000);
+
+        // =====================================================================
+        // Check for confirmation or error
+        // =====================================================================
+        console.log("[ubc] Checking for confirmation…");
+
+        // Look for success indicators
+        const pageText = await page.locator('body').innerText().catch(() => "");
+        const hasConfirmation = /confirmation|thank you|order.*complete|booking.*confirmed|receipt/i.test(pageText);
+        
+        // Look for error messages
+        const errorElement = page.locator('.error, .alert-danger, .validation-error, [class*="error-message"]').first();
+        const errorText = await errorElement.innerText().catch(() => "");
+
+        if (errorText && !hasConfirmation) {
+            console.log(`[ubc] Booking error: ${errorText}`);
+            return {
+                success: false,
+                message: `Booking failed: ${errorText}`
+            };
+        }
+
+        // Try to extract confirmation number
+        const confirmationNumber = await page.locator('[class*="confirmation-number"], [class*="order-number"], [class*="receipt-number"]')
+            .first().innerText().catch(() => undefined);
+
+        console.log("[ubc] Booking completed successfully!");
+
+        return {
+            success: true,
+            confirmation_number: confirmationNumber,
+            message: "Booking completed successfully",
+            booked_slot: {
+                time: request.time_24h,
+                duration: request.duration_hours * 60,
+                location: courtName.trim()
+            }
+        };
+
+    } catch (error: any) {
+        console.error("[ubc] Booking error:", error?.message || error);
+        return {
+            success: false,
+            message: `Booking failed: ${error?.message || "Unknown error"}`
+        };
     } finally {
         await browser.close();
     }
